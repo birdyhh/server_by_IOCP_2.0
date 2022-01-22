@@ -63,8 +63,16 @@ public:
 	}
 	//启动服务器
 	bool Start(int port);
+	//停止服务器
+	void Stop();
+	//获得本机的IP地址
+	string GetLocalIP();
 
 protected:
+	//初始化IOCP
+	bool _InitializeIOCP();
+	//初始化Socket
+	bool _InitializeListenSocket();
 	//线程函数，为IOCP请求服务的工作者线程
 	DWORD WINAPI _WorkerThread(LPVOID lpParam);
 
