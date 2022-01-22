@@ -150,7 +150,10 @@ void CIocpModel::Stop()
 *函数功能：初始化IOCP
 *函数参数：无
 *函数返回：BOOL:false表示启动失败，true表示启动成功
-*函数说明：
+*函数说明：完成以下事务：
+*			1.初始化完成端口
+*			2.建立对应的线程数
+*			3.为工作者线程初始化句柄
 **************************************/
 bool CIocpModel::_InitializeIOCP()
 {
@@ -181,19 +184,147 @@ bool CIocpModel::_InitializeIOCP()
 
 /**************************************
 *函数名称：_InitializeListenSocket()
-*函数功能：
+*函数功能：初始化Socket
 *函数参数：无
-*函数返回：BOOL:false表示启动失败，true表示启动成功
-*函数说明：
+*函数返回：BOOL:false表示初始化失败，true表示初始化成功
+*函数说明：完成以下事务：
+*			1.生成socket后，绑定到完成端口中，绑定到ip地址和端口上，然后开始监听
+*			2.获取并保存AcceptEx函数和GetAcceptExSockAddrs函数的指针
+*			3.创建10个套接字，投递AcceptEx请求
 **************************************/
 bool CIocpModel::_InitializeListenSocket()
 {
 	this->_ShowMessage("初始化Socket-InitializeListenSocket()");
 	b_pListenContext = new SocketContext;
+	//生成重叠IO的socket
 	b_pListenContext->b_Socket = WSASocket(PF_INET, SOCK_STREAM,
 		IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-	if()
+	if (INVALID_SOCKET == b_pListenContext->b_Socket)
+	{
+		this->_ShowMessage("WSASocket() 失败，err=%d", WSAGetLastError());
+		this->_DeInitialize();
+		return false;
+	}
+	else
+	{
+		this->_ShowMessage("创建WSASocket() 完成");
+	}
+	//将listen Socket绑定到完成端口
+	if (NULL == CreateIoCompletionPort((HANDLE)b_pListenContext->b_Socket,
+		b_hIOCompletionPort, (DWORD)b_pListenContext, 0));
+	{
+		this->_ShowMessage("绑定失败！ err=%d", WSAGetLastError());
+		this->_DeInitialize();
+		return false;
+	}
+
+	//填充地址信息
+	//服务器地址信息
+	sockaddr_in serverAddress;
+	ZeroMemory(&serverAddress, sizeof(serverAddress));
+	serverAddress.sin_family = AF_INET;
+	serverAddress.sin_port = htons(b_nPorts);
+	serverAddress.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	//绑定端口和地址
+	if (SOCKET_ERROR == bind(b_pListenContext->b_Socket,
+		(sockaddr*)&serverAddress, sizeof(serverAddress)))
+	{
+		this->_ShowMessage("bind()函数执行失败");
+		this->_DeInitialize();
+		return false;
+	}
+	else
+	{
+		this->_ShowMessage("bind() 完成");
+	}
+
+	//监听端口和地址
+	if (SOCKET_ERROR == listen(b_pListenContext->b_Socket,MAX_LISTEN_SOCKET))
+	{
+		this->_ShowMessage("listen()函数执行失败");
+		this->_DeInitialize();
+		return false;
+	}
+	else
+	{
+		this->_ShowMessage("listen() 完成");
+	}
+
+	//提前获取AcceptEx函数指针，不必在后续多次调用AcceptEx函数过程中使用WSAIoctl函数
+	//避免多次使用WSAIoctl函数这个很影响性能的操作
+	DWORD dwBytes = 0;
+	GUID GuidAcceptEx = WSAID_ACCEPTEX;
+	GUID GuidGetAcceptExSockAddrs = WSAID_GETACCEPTEXSOCKADDRS;
+	if (SOCKET_ERROR == WSAIoctl(b_pListenContext->b_Socket,
+		SIO_GET_EXTENSION_FUNCTION_POINTER, &GuidAcceptEx,
+		sizeof(GuidAcceptEx), &b_lpfnAcceptEx,
+		sizeof(b_lpfnAcceptEx), &dwBytes, NULL, NULL))
+	{
+		this->_ShowMessage("WSAIoct1 未能获取AcceptEx函数指针。错误代码: %d",
+			WSAGetLastError());
+		this->_DeInitialize();
+		return false;
+	}
+
+	//同理，获取GetAcceptExSockAddrs()函数指针
+	if (SOCKET_ERROR == WSAIoctl(b_pListenContext->b_Socket,
+		SIO_GET_EXTENSION_FUNCTION_POINTER, &GuidGetAcceptExSockAddrs,
+		sizeof(GuidGetAcceptExSockAddrs), &b_lpfnGetAcceptExSockAddrs,
+		sizeof(b_lpfnGetAcceptExSockAddrs), &dwBytes, NULL, NULL))
+	{
+		this->_ShowMessage("WSAIoct1 未能获取GetAcceptExSockAddrs函数指针。错误代码: %d",
+			WSAGetLastError());
+		this->_DeInitialize();
+		return false;
+	}
+
+	//为AcceptEx 准备参数，然后投递AcceptEx I/O请求
+	//创建10个套接字，投递AcceptEx请求，即共有10个套接字进行accept操作；
+	//可修改宏MAX_POST_ACCEPT，改变同时投递的AcceptEx请求的数量，默认为10
+	for (size_t i = 0; i < MAX_POST_ACCEPT; i++)
+	{
+		//新建一个IO_CONTEXT
+		IoContext* pIoContext = b_pListenContext->GetNewIoContext();
+		if (pIoContext && !this->_PostAccept(pIoContext))
+		{
+			b_pListenContext->RemoveContext(pIoContext);
+			return false;
+		}
+	}
+	this->_ShowMessage("投递 %d 个AcceptEx请求完毕", MAX_POST_ACCEPT);
+	return true;
 }
+
+/**************************************
+*函数名称：_DeInitialize()
+*函数功能：释放掉所有资源
+*函数参数：无
+*函数返回：无
+*函数说明：完成以下事务：
+*			1.
+*			2.
+*			3.
+**************************************/
+void CIocpModel::_DeInitialize()
+{
+	//删除客户端互斥量
+	DeleteCriticalSection(&b_csContextList);
+	//关闭系统退出时间句柄
+	RELEASE_HANDLE(b_hShutdownEvent);
+	//释放工作者线程句柄指针
+	for (int i = 0; i < b_nThreads; i++)
+	{
+		RELEASE_HANDLE(b_phWorkerThreads[i]);
+	}
+	RELEASE_ARRAY(b_phWorkerThreads);
+	//关闭IOCP句柄
+	RELEASE_HANDLE(b_hIOCompletionPort);
+	//关闭监听socket
+	RELEASE_POINTER(b_pListenContext);
+	this->_ShowMessage("释放资源完毕");
+}
+
 //在主页面输出信息
 void CIocpModel::_ShowMessage(const char* szFormat, ...)
 {
