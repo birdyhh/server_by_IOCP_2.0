@@ -1,4 +1,5 @@
 #include "IocpModel.h"
+#include <mstcpip.h> 
 
 #pragma comment(lib,"ws2_32.lib")
 
@@ -38,17 +39,83 @@ CIocpModel::~CIocpModel()
 ******************************************************************************/
 DWORD WINAPI CIocpModel::_WorkerThread(LPVOID lpParam)
 {
+	WorkerThreadParam* pParam = (WorkerThreadParam*)lpParam;
+	CIocpModel* pIocpModel = (CIocpModel*)pParam->pIocpModel;
+	const int nThreadNo = pParam->nThreadNo;
+	const int nThreadId = pParam->nThreadId;
 
+	pIocpModel->_ShowMessage("工作者线程，No:%d, ID:%d", nThreadNo, nThreadId);
+	//循环处理请求，知道接收到shutdown信息为止
+	while (WAIT_OBJECT_0 != WaitForSingleObject(pIocpModel->b_hShutdownEvent, 0))
+	{
+		DWORD dwBytesTransfered = 0;
+		OVERLAPPED* pOverlapped = nullptr;
+		SocketContext* pSoContext = nullptr;
+		const bool bRet = GetQueuedCompletionStatus(pIocpModel->b_hIOCompletionPort,
+			&dwBytesTransfered, (PULONG_PTR)&pSoContext, &pOverlapped, INFINITE);
+		IoContext* pIoContext = CONTAINING_RECORD(pOverlapped, IoContext, b_Overlapped);
+		if (EXIT_CODE == (DWORD)pSoContext)
+		{
+			break;
+		}
+		if (!bRet)
+		{
+			const DWORD dwErr = GetLastError();
+			if (!pIocpModel->HandleError(pSoContext, dwErr))
+			{
+				break;
+			}
+			continue;
+		}
+		else
+		{
+			if ((dwBytesTransfered == 0) && (PostType::RECV == pIoContext->b_PostType
+				|| PostType::SEND == pIoContext->b_PostType))
+			{
+				pIoContext->OnConnectionClosed(pSoContext);
+				pIoContext->_DoClose(pSoContext);
+				continue;
+			}
+			else
+			{
+				switch (pIoContext->b_PostType)
+				{
+				case PostType::ACCEPT :
+				{
+					pIoContext->b_nTotalBytes = dwBytesTransfered;
+					pIocpModel->_DoAccept(pSoContext, pIoContext);
+				}
+				break;
+
+				case PostType::RECV :
+				{
+					pIoContext->b_nTotalBytes = dwBytesTransfered;
+					pIocpModel->_DoRecv(pSoContext, pIoContext);
+				}
+				break;
+
+				case PostType::SEND :
+				{
+					pIoContext->b_nTotalBytes = dwBytesTransfered;
+					pIocpModel->_DoSend(pSoContext, pIoContext);
+				}
+				break;
+
+				default:
+					pIocpModel->_ShowMessage("_WorkThread中的m_OpType 参数异常");
+					break;
+				}
+			}
+		}
+	}
+	pIocpModel->_ShowMessage("工作者线程 %d 号退出", nThreadNo);
+	RELEASE_POINTER(lpParam);
+	return 0;
 }
 
 //=============================================================================
 //					          系统的初始化和终止
 //=============================================================================
-// 函数1：LoadSocketLib()初始化WINSOCK
-// 函数2：Start()启动服务器
-// 函数3：Stop()停止服务器
-// 
-// 
 
 /**************************************
 *函数名称：LoadSocketLib()
@@ -174,7 +241,7 @@ bool CIocpModel::_InitializeIOCP()
 		WorkerThreadParam* pThreadParams = new WorkerThreadParam;
 		pThreadParams->pIocpModel = this;
 		pThreadParams->nThreadNo = i + 1;
-		b_phWorkerThreads[i] = CreateThread(0, 0, _WorkerThread,
+		b_phWorkerThreads[i] = ::CreateThread(0, 0, _WorkerThread,
 			(void*)pThreadParams, 0, &nThreadID);
 		pThreadParams->nThreadId = nThreadID;
 	}
@@ -301,10 +368,7 @@ bool CIocpModel::_InitializeListenSocket()
 *函数功能：释放掉所有资源
 *函数参数：无
 *函数返回：无
-*函数说明：完成以下事务：
-*			1.
-*			2.
-*			3.
+*函数说明：关闭所有工作的线程，关闭所有句柄，释放所有指针
 **************************************/
 void CIocpModel::_DeInitialize()
 {
@@ -325,6 +389,247 @@ void CIocpModel::_DeInitialize()
 	this->_ShowMessage("释放资源完毕");
 }
 
+
+
+//=============================================================================
+//				 投递完成端口请求
+//=============================================================================
+
+/**************************************
+*函数名称：_PostAccept()
+*函数功能：投递Accept请求
+*函数参数：pIoContext:数据结构体，保存了每次重叠io所需的数据结构
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：提前为新客户端准备套接字，降低在客户端连接后耗费系统资源创建套接字；
+*			投递acceptex
+**************************************/
+bool CIocpModel::_PostAccept(IoContext* pIoContext)
+{
+	if (b_pListenContext == NULL || b_pListenContext->b_Socket == INVALID_SOCKET)
+	{
+		throw "_PostAccept, b_pListenContext or b_Socket INVALID!";
+	}
+	pIoContext->ResetBuffer();
+	pIoContext->b_PostType = PostType::ACCEPT;
+	//为以后新连接的客户端准备好socket（与传统的socket最大的区别）
+	pIoContext->b_acceptSocket = WSASocket(PF_INET, SOCK_STREAM, IPPROTO_TCP,
+		NULL, 0, WSA_FLAG_OVERLAPPED);
+	if (INVALID_SOCKET == pIoContext->b_acceptSocket)
+	{
+		//投递多少次ACCEPT，就创建多少socket；
+		_ShowMessage("创建用于Accept的Socket失败！err=%d", WSAGetLastError());
+		return false;
+	}
+	
+	//投递AcceptEx
+	//将接受缓冲设置为0，令AcceptEx直接返回
+	DWORD dwBytes = 0, dwAddrLen = (sizeof(sockaddr_in) + 16);
+	WSABUF* pWSAbuf = &pIoContext->b_wsaBuf;
+	if (!b_lpfnAcceptEx(b_pListenContext->b_Socket, pIoContext->b_acceptSocket,
+		pWSAbuf->buf, 0, dwAddrLen, dwAddrLen, &dwBytes, &pIoContext->b_Overlapped));
+	{
+		int nErr = WSAGetLastError();
+		if (WSA_IO_PENDING != nErr)
+		{// Overlapped I/O operation is in progress.
+			_ShowMessage("投递 AcceptEx 失败，err=%d", nErr);
+			return false;
+		}
+	}
+	//原子操作，类似于加锁后再+1，防止其他线程在操作过程中修改
+	InterlockedIncrement(&acceptPostCount);
+	return true;
+}
+
+/**************************************
+*函数名称：_DoAccept
+*函数功能：函数进行客户端接入处理；
+*函数参数：SocketContext* pSoContext:	本次accept操作对应的套接字，该套接字所对应的数据结构；
+IoContext* pIoContext:			本次accept操作对应的数据结构；
+DWORD		dwIOSize:			本次操作数据实际传输的字节数
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：设置了心跳包
+**************************************/
+bool CIocpModel::_DoAccept(SocketContext* pSoContext, IoContext* pIoContext)
+{
+	InterlockedIncrement(&connectCount);
+	InterlockedDecrement(&acceptPostCount);
+	//获得对方地址
+	SOCKADDR_IN* clientAddr = NULL, * localAddr = NULL;
+	DWORD dwAddrLen = (sizeof(SOCKADDR_IN) + 16);
+	int remoteLen = 0, localLen = 0;
+	this->b_lpfnGetAcceptExSockAddrs(pIoContext->b_wsaBuf.buf,
+		0, dwAddrLen, dwAddrLen, (LPSOCKADDR*)&localAddr, &localLen,
+		(LPSOCKADDR*)&clientAddr, &remoteLen);
+
+	//为新地址建立一个socketcontext
+	SocketContext* pNewSocketContext = new SocketContext;
+	//加入到ContextList中去（统一管理，方便释放资源）
+	this->_AddToContextList(pNewSocketContext);
+	pNewSocketContext->b_Socket = pIoContext->b_acceptSocket;
+	memcpy(&(pNewSocketContext->b_ClientAddr), clientAddr, sizeof(SOCKADDR_IN));
+
+	//将listenSocketContext中的IOContext 重置后继续投递AcceptEx
+	if (!_PostAccept(pIoContext))
+	{
+		pSoContext->RemoveContext(pIoContext);
+	}
+
+	//将新socket和完成端口绑定
+	if (!this->_AssociateWithIOCP(pNewSocketContext))
+	{
+		//失败的话无需release，在函数中已经release
+		return false;
+	}
+
+	//设置心跳包
+	tcp_keepalive alive_in = { 0 }, alive_out{ 0 };
+	//60s 没有数据就开始send心跳包
+	alive_in.keepalivetime = 1000 * 60;
+	//10s 每隔10s send一个心跳包
+	alive_in.keepaliveinterval = 1000 * 10;
+	alive_in.onoff = true;
+	DWORD lpcbBytesReturned = 0;
+	if (SOCKET_ERROR == WSAIoctl(pNewSocketContext->b_Socket, SIO_KEEPALIVE_VALS,
+		&alive_in, sizeof(alive_in), &alive_out, sizeof(alive_out), &lpcbBytesReturned,
+		NULL, NULL))
+	{
+		_ShowMessage("WSAIoctl() failed: %d\n", WSAGetLastError());
+	}
+	OnConnectionAccepted(pNewSocketContext);
+
+	//建立recv所需的ioContext，在新连接的socket投递recv请求
+	IoContext* pNewIoContext = pNewSocketContext->GetNewIoContext();
+	if (pNewIoContext != NULL)
+	{
+		pNewIoContext->b_PostType = PostType::RECV;
+		pNewIoContext->b_acceptSocket = pNewSocketContext->b_Socket;
+		//投递recv请求
+		return _PostRecv(pNewSocketContext, pNewIoContext);
+	}
+	else
+	{
+		_DoClose(pNewSocketContext);
+		return false;
+	}
+}
+
+/**************************************
+*函数名称：_PostRecv
+*函数功能：投递WSARecv请求；
+*函数参数：IoContext* pIoContext:	用于进行IO的套接字上的结构，主要为WSARecv参数和WSASend参数；
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：与_DoRecv配套
+**************************************/
+bool CIocpModel::_PostRecv(SocketContext* pSoContext, IoContext* pIoContext)
+{
+	pIoContext->ResetBuffer();
+	pIoContext->b_PostType = PostType::RECV;
+	pIoContext->b_nTotalBytes = 0;
+	pIoContext->b_nSentBytes = 0;
+	//初始化变量
+	DWORD dwFlags = 0, dwBytes = 0;
+	const int nBytesRecv = WSARecv(pIoContext->b_acceptSocket, &pIoContext->b_wsaBuf,
+		1, &dwBytes, &dwFlags, &pIoContext->b_Overlapped, NULL);
+	if (SOCKET_ERROR == nBytesRecv)
+	{
+		int nErr = WSAGetLastError();
+		if (WSA_IO_PENDING != nErr)
+		{// Overlapped I/O operation is in progress.
+			this->_ShowMessage("投递WSARecv失败！err=%d", nErr);
+			this->_DoClose(pSoContext);
+			return false;
+		}
+	}
+	return true;
+}
+
+/**************************************
+*函数名称：_DoRecv
+*函数功能：在有接收的数据到达的时候，进行处理
+*函数参数：IoContext* pIoContext:	用于进行IO的套接字上的结构
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：回到应用层进行处理
+**************************************/
+bool CIocpModel::_DoRecv(SocketContext* pSoContext, IoContext* pIoContext)
+{
+	//先把收到的数据显示出现，然后重置状态，发出下一个Recv请求
+	//SOCKADDR_IN* clientAddr = &pSoContext->b_ClientAddr;
+	this->OnRecvCompleted(pSoContext, pIoContext);
+	return true;
+}
+
+/**************************************
+*函数名称：_PostSend
+*函数功能：投递WSASend请求
+*函数参数：IoContext* pIoContext:用于进行IO的套接字上的结构
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：调用PostWrite之前需要设置pIoContext中m_wsaBuf, m_nTotalBytes, m_nSendBytes；
+**************************************/
+bool CIocpModel::_PostSend(SocketContext* pSoContext, IoContext* pIoContext)
+{
+	pIoContext->b_PostType = PostType::SEND;
+	pIoContext->b_nTotalBytes = 0;
+	pIoContext->b_nSentBytes = 0;
+	const DWORD dwFlags = 0;
+	DWORD dwSendNumBytes = 0;
+	const int nRet = WSASend(pIoContext->b_acceptSocket, &pIoContext->b_wsaBuf,
+		1, &dwSendNumBytes, dwFlags, &pIoContext->b_Overlapped, NULL);
+	if (SOCKET_ERROR == nRet)
+	{
+		int nErr = WSAGetLastError();
+		if (WSA_IO_PENDING != nErr)
+		{// Overlapped I/O operation is in progress.
+			this->_ShowMessage("投递WSASend失败！err=%d", nErr);
+			this->_DoClose(pSoContext);
+			return false;
+		}
+	}
+	return true;
+}
+
+/**************************************
+*函数名称：_DoSend
+*函数功能：继续完成发送数据或者通知应用层已发送完毕
+*函数参数：IoContext* pIoContext:用于进行IO的套接字上的结构
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：
+**************************************/
+bool CIocpModel::_DoSend(SocketContext* pSoContext, IoContext* pIoContext)
+{
+	if (pIoContext->b_nSentBytes < pIoContext->b_nTotalBytes)
+	{
+		//数据未发送完，继续发送
+		pIoContext->b_wsaBuf.buf = pIoContext->b_szBuffer + pIoContext->b_nSentBytes;
+		pIoContext->b_wsaBuf.len = pIoContext->b_nTotalBytes - pIoContext->b_nSentBytes;
+		return this->_PostSend(pSoContext, pIoContext);
+	}
+	else
+	{
+		//通知应用层已发送完毕
+		this->OnSendCompleted(pSoContext, pIoContext);
+		return true;
+	}
+}
+
+/**************************************
+*函数名称：_DoClose
+*函数功能：检查是否能关闭
+*函数参数：
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：
+**************************************/
+bool CIocpModel::_DoClose(SocketContext* pSoContext)
+{
+	if (pSoContext != b_pListenContext)
+	{
+		//这个
+		InterlockedDecrement(&connectCount);
+		this->_RemoveContext(pSoContext);
+		return true;
+	}
+	InterlockedIncrement(&errorCount);
+	return false;
+}
 //在主页面输出信息
 void CIocpModel::_ShowMessage(const char* szFormat, ...)
 {

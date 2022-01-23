@@ -13,7 +13,7 @@
 #define RELEASE_HANDLE(x) {if(x != nullptr && x != INVALID_HANDLE_VALUE)\
 	{ CloseHandle(x);x=nullptr;}}				 //释放句柄宏
 #define RELEASE_SOCKET(x) {if(x != NULL && x != INVALID_SOCKET)\
-	{ closesocket(x);x=INVALID_SOCKET}}          //释放Socket宏
+	{ closesocket(x);x=INVALID_SOCKET;}}          //释放Socket宏
 
 //=============================================================================
 //						CIocpModel类定义
@@ -75,8 +75,22 @@ protected:
 	bool _InitializeListenSocket();
 	//最后释放资源
 	void _DeInitialize();
+	//投递AccpetEx请求
+	bool _PostAccept(IoContext* pIoContext);
+	//有客户端连接时，进行处理
+	bool _DoAccept(SocketContext* pSoContext, IoContext* pIoContext);
+	//投递WSARecv用于接收数据
+	bool _PostRecv(SocketContext* pSoContext, IoContext* pIoContext);
+	//数据到达，数组存放在pIoContext参数中
+	bool _DoRecv(SocketContext* pSoContext, IoContext* pIoContext);
+	//投递WSASend，用于发送数据
+	bool _PostSend(SocketContext* pSoContext, IoContext* pIoContext);
+	bool _DoSend(SocketContext* pSoContext, IoContext* pIoContext);
+	bool _DoClose(SocketContext* pSoContext);
+
 	//线程函数，为IOCP请求服务的工作者线程
-	DWORD WINAPI _WorkerThread(LPVOID lpParam);
+	//须声明为静态全局函数，否则无法被调用
+	static DWORD WINAPI _WorkerThread(LPVOID lpParam);
 
 	//在主页面输出信息
 	virtual void _ShowMessage(const char* szFormat, ...);
