@@ -39,7 +39,7 @@ private:
 	string                 b_strIP;              //服务器端的IP地址
 	int                    b_nPorts;             //服务器端的监听地址
 	CRITICAL_SECTION       b_csContextList;      //用于Worker线程同步的互斥量
-	vector<SocketContext*> b_arratyClientContext;//客户端Socket的Context信息
+	vector<SocketContext*> b_arrayClientContext;//客户端Socket的Context信息
 	SocketContext*         b_pListenContext;     //用于监听Socket的Context信息
 	LONG                   acceptPostCount;      //当前投递的Accept数量
 	LONG                   connectCount;		 //当前的连接数量
@@ -62,11 +62,34 @@ public:
 		WSACleanup();
 	}
 	//启动服务器
-	bool Start(int port);
+	bool Start(int port = DEFAULT_PORT);
 	//停止服务器
 	void Stop();
 	//获得本机的IP地址
 	string GetLocalIP();
+	// 向指定客户端发送数据
+	bool SendData(SocketContext* pSoContext, char* data, int size);
+	bool SendData(SocketContext* pSoContext, IoContext* pIoContext);
+	// 继续接收指定客户端的数据
+	bool RecvData(SocketContext* pSoContext, IoContext* pIoContext);
+
+	// 获取当前连接数
+	int GetConnectCount() { return connectCount; }
+	// 获取当前监听端口
+	unsigned int GetPort() { return b_nPorts; }
+
+	// 事件通知函数(派生类重载此族函数)
+	virtual void OnConnectionAccepted(SocketContext* pSoContext) {};
+	virtual void OnConnectionClosed(SocketContext* pSoContext) {};
+	virtual void OnConnectionError(SocketContext* pSoContext, int error) {};
+	virtual void OnRecvCompleted(SocketContext* pSoContext, IoContext* pIoContext)
+	{
+		SendData(pSoContext, pIoContext); // 接收数据完成，原封不动发回去
+	};
+	virtual void OnSendCompleted(SocketContext* pSoContext, IoContext* pIoContext)
+	{
+		RecvData(pSoContext, pIoContext); // 发送数据完成，继续接收数据
+	};
 
 protected:
 	//初始化IOCP
@@ -87,6 +110,20 @@ protected:
 	bool _PostSend(SocketContext* pSoContext, IoContext* pIoContext);
 	bool _DoSend(SocketContext* pSoContext, IoContext* pIoContext);
 	bool _DoClose(SocketContext* pSoContext);
+	//将客户端socket的相关信息存储到数组中
+	void _AddToContextList(SocketContext* pSoContext);
+	//将客户端socket的信息从数组中移除
+	void _RemoveContext(SocketContext* pSoContext);
+	// 清空客户端socket信息
+	void _ClearContextList();
+	// 将句柄绑定到完成端口中
+	bool _AssociateWithIOCP(SocketContext* pSoContext);
+	// 处理完成端口上的错误
+	bool HandleError(SocketContext* pSoContext, const DWORD& dwErr);
+	//获得本机的处理器数量
+	int _GetNumOfProcessors() noexcept;
+	//判断客户端Socket是否已经断开
+	bool _IsSocketAlive(SOCKET s) noexcept;
 
 	//线程函数，为IOCP请求服务的工作者线程
 	//须声明为静态全局函数，否则无法被调用
@@ -94,5 +131,10 @@ protected:
 
 	//在主页面输出信息
 	virtual void _ShowMessage(const char* szFormat, ...);
+
+public:
+	void SetLogFunc(LOG_FUNC fn) { b_LogFunc = fn; }
+protected:
+	LOG_FUNC b_LogFunc;
 };
 

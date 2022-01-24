@@ -72,8 +72,8 @@ DWORD WINAPI CIocpModel::_WorkerThread(LPVOID lpParam)
 			if ((dwBytesTransfered == 0) && (PostType::RECV == pIoContext->b_PostType
 				|| PostType::SEND == pIoContext->b_PostType))
 			{
-				pIoContext->OnConnectionClosed(pSoContext);
-				pIoContext->_DoClose(pSoContext);
+				pIocpModel->OnConnectionClosed(pSoContext);
+				pIocpModel->_DoClose(pSoContext);
 				continue;
 			}
 			else
@@ -278,7 +278,7 @@ bool CIocpModel::_InitializeListenSocket()
 	}
 	//将listen Socket绑定到完成端口
 	if (NULL == CreateIoCompletionPort((HANDLE)b_pListenContext->b_Socket,
-		b_hIOCompletionPort, (DWORD)b_pListenContext, 0));
+		b_hIOCompletionPort, (DWORD)b_pListenContext, 0))
 	{
 		this->_ShowMessage("绑定失败！ err=%d", WSAGetLastError());
 		this->_DeInitialize();
@@ -394,6 +394,47 @@ void CIocpModel::_DeInitialize()
 //=============================================================================
 //				 投递完成端口请求
 //=============================================================================
+
+/**************************************
+*函数名称：SendData
+*函数功能：投递WSASend请求，发送数据
+*函数参数：data发送的数据，size数据大小
+*			重载函数：有已初始化的IoContext
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：借助_PostSend函数进行发送
+**************************************/
+bool CIocpModel::SendData(SocketContext* pSoContext, char* data, int size)
+{
+	this->_ShowMessage("SendData(): s=%p d=%p", pSoContext, data);
+	if (!pSoContext || !data || size <= 0 || size > MAX_BUFFER_LEN)
+	{
+		this->_ShowMessage("SendData()，参数有误");
+		return false;
+	}
+	//投递WSASend请求，发送数据
+	IoContext* pNewIoContext = pSoContext->GetNewIoContext();
+	pNewIoContext->b_acceptSocket = pSoContext->b_Socket;
+	pNewIoContext->b_PostType = PostType::SEND;
+	pNewIoContext->b_nTotalBytes = size;
+	pNewIoContext->b_wsaBuf.len = size;
+	memcpy(pNewIoContext->b_wsaBuf.buf, data, size);
+	if (!this->_PostSend(pSoContext, pNewIoContext))
+	{// 无需RELEASE_POINTER，失败时，已经release了
+		// RELEASE_POINTER(pNewSocketContext);
+		return false;
+	}
+	return true;
+}
+
+bool CIocpModel::SendData(SocketContext* pSoContext, IoContext* pIoContext)
+{
+	return this->_PostSend(pSoContext, pIoContext);
+}
+
+bool CIocpModel::RecvData(SocketContext* pSoContext, IoContext* pIoContext)
+{
+	return this->_PostRecv(pSoContext, pIoContext);
+}
 
 /**************************************
 *函数名称：_PostAccept()
@@ -630,6 +671,199 @@ bool CIocpModel::_DoClose(SocketContext* pSoContext)
 	InterlockedIncrement(&errorCount);
 	return false;
 }
+
+/**************************************
+*函数名称：_AssociateWithIOCP
+*函数功能：将句柄(Socket)绑定到完成端口中
+*函数参数：
+*函数返回：BOOL:false表示失败，true表示成功
+*函数说明：
+**************************************/
+bool CIocpModel::_AssociateWithIOCP(SocketContext* pSoContext) 
+{
+	HANDLE hTemp = CreateIoCompletionPort((HANDLE)pSoContext->b_Socket,
+		b_hIOCompletionPort, (DWORD)pSoContext, 0);
+	if (hTemp == nullptr)
+	{
+		this->_ShowMessage("绑定IOCP失败。err=%d", GetLastError());
+		this->_DoClose(pSoContext);
+		return false;
+	}
+	return true;
+}
+//=====================================================================
+//				 ContextList 相关操作
+//=====================================================================
+
+/**************************************
+*函数名称：_AddToContextList
+*函数功能：将客户端的相关信息存储到数组中
+*函数参数：客户端SocketContext指针
+*函数返回：
+*函数说明：使用互斥锁
+**************************************/
+void CIocpModel::_AddToContextList(SocketContext* pSoContext)
+{
+	EnterCriticalSection(&b_csContextList);
+	b_arrayClientContext.push_back(pSoContext);
+	LeaveCriticalSection(&b_csContextList);
+}
+
+/**************************************
+*函数名称：_RemoveContext
+*函数功能：将客户端的相关信息删除
+*函数参数：客户端SocketContext指针
+*函数返回：
+*函数说明：使用互斥锁
+**************************************/
+void CIocpModel::_RemoveContext(SocketContext* pSoContext)
+{
+	EnterCriticalSection(&b_csContextList);
+	vector<SocketContext*>::iterator it;
+	it = b_arrayClientContext.begin();
+	while (it != b_arrayClientContext.end())
+	{
+		SocketContext* pContext = *it;
+		if (pSoContext == pContext)
+		{
+			delete pSoContext;
+			pSoContext = nullptr;
+			it = b_arrayClientContext.erase(it);
+			break;
+		}
+		it++;
+	}
+	LeaveCriticalSection(&b_csContextList);
+}
+
+/**************************************
+*函数名称：_ClearContextList
+*函数功能：将客户端的所有相关信息删除，清空客户端信息
+*函数参数：
+*函数返回：
+*函数说明：使用互斥锁
+**************************************/
+void CIocpModel::_ClearContextList()
+{
+	EnterCriticalSection(&b_csContextList);
+	for (size_t i = 0; i < b_arrayClientContext.size(); i++)
+	{
+		delete b_arrayClientContext.at(i);
+	}
+	b_arrayClientContext.clear();
+	LeaveCriticalSection(&b_csContextList);
+}
+
+
+//================================================================================
+//				 其他辅助函数定义
+//================================================================================
+/**************************************
+*函数名称：GetLocalIP
+*函数功能：获得IP地址
+*函数参数：
+*函数返回：
+*函数说明：
+**************************************/
+string CIocpModel::GetLocalIP()
+{
+	// 获得本机主机名
+	char hostname[MAX_PATH] = { 0 };
+	gethostname(hostname, MAX_PATH);
+	struct hostent FAR* lpHostEnt = gethostbyname(hostname);
+	if (lpHostEnt == NULL)
+	{
+		return DEFAULT_IP;
+	}
+	// 取得IP地址列表中的第一个为返回的IP(因为一台主机可能会绑定多个IP)
+	const LPSTR lpAddr = lpHostEnt->h_addr_list[0];
+	// 将IP地址转化成字符串形式
+	struct in_addr inAddr;
+	memmove(&inAddr, lpAddr, 4);
+	b_strIP = string(inet_ntoa(inAddr));
+	return b_strIP;
+}
+
+/**************************************
+*函数名称：_GetNumOfProcessors
+*函数功能：获得本机中处理器的数量
+*函数参数：
+*函数返回：
+*函数说明：创建对应的完成端口线程
+**************************************/
+int CIocpModel::_GetNumOfProcessors() noexcept
+{
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	return si.dwNumberOfProcessors;
+}
+
+/**************************************
+*函数名称：_IsSocketAlive
+*函数功能：判断客户端Socket是否已经断开，否则在一个无效的Socket上投递WSARecv操作会出现异常
+*函数参数：
+*函数返回：
+*函数说明：用的方法是尝试向这个socket发送数据，判断这个socket调用的返回值
+**************************************/
+bool CIocpModel::_IsSocketAlive(SOCKET s) noexcept
+{
+	const int nByteSent = send(s, "", 0, 0);
+	if (SOCKET_ERROR == nByteSent)
+	{
+		return false;
+	}
+	else
+	{
+		return true;
+	}
+}
+
+/**************************************
+*函数名称：_IsSocketAlive
+*函数功能：显示并处理完成端口上的错误
+*函数参数：dwErr：错误码
+*函数返回：
+*函数说明：
+**************************************/
+bool CIocpModel::HandleError(SocketContext* pSoContext, const DWORD& dwErr)
+{
+	// 如果是超时了，就再继续等吧 0x102=258L
+	if (WAIT_TIMEOUT == dwErr)
+	{
+		// 确认客户端是否还活着...
+		if (!_IsSocketAlive(pSoContext->b_Socket))
+		{
+			this->_ShowMessage("检测到客户端异常退出！");
+			this->OnConnectionClosed(pSoContext);
+			this->_DoClose(pSoContext);
+			return true;
+		}
+		else
+		{
+			this->_ShowMessage("网络操作超时！重试中..");
+			return true;
+		}
+	}
+	// 可能是客户端异常退出了; 0x40=64L
+	else if (ERROR_NETNAME_DELETED == dwErr)
+	{// 出这个错，可能是监听SOCKET挂掉了
+		//this->_ShowMessage("检测到客户端异常退出！");
+		this->OnConnectionError(pSoContext, dwErr);
+		if (!this->_DoClose(pSoContext))
+		{
+			this->_ShowMessage("检测到异常！");
+		}
+		return true;
+	}
+	else
+	{//ERROR_OPERATION_ABORTED=995L
+		this->_ShowMessage("完成端口操作出错，线程退出。err=%d", dwErr);
+		this->OnConnectionError(pSoContext, dwErr);
+		this->_DoClose(pSoContext);
+		return false;
+	}
+}
+
 //在主页面输出信息
 void CIocpModel::_ShowMessage(const char* szFormat, ...)
 {
