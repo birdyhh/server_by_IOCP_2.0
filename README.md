@@ -15,17 +15,19 @@ Windows (msvc 2013+)
 
 ## 测试
 ![](https://raw.githubusercontent.com/birdyhh/server_by_IOCP_2.0/main/text.png)
-测试环境：Windows11 CPU:i5-9600k 内存：16G
-采用了完成端口的Server程序在10000个线程的连接下，CPU的占用非常低，反而是采用了多个并发线程的Client程序界面已经奔溃，且CPU占用高。
+**测试环境**：Windows11 CPU:i5-9600k 内存：16G<br>
+采用了完成端口的Server程序在10000个线程的连接下，CPU的占用非常低，反而是采用了多个并发线程的Client程序界面已经奔溃，且CPU占用高。<br>
 虽然这不是服务器的压力测试，但是可以看得出Windows下IOCP的实力。
 ## TODO
-1.使用完成端口来传送文件
-2.使用智能指针来管理资源
-3.用更好的数据结构来管理数据
-4.完善异常处理机制
-5.添加http功能
+1. 使用完成端口来传送文件<br>
+2. 使用智能指针来管理资源<br>
+3. 用更好的数据结构来管理数据<br>
+4. 完善异常处理机制<br>
+5. 添加http功能<br>
 
 ## 致谢
 TCP/IP网络编程 【韩】尹圣雨 著 金国哲 译
+
+---
 
 Revised by Birdyhh at 2022/1
